@@ -66,6 +66,13 @@ namespace RemoteTech.FlightComputer
         public IEnumerable<ICommand> ActiveCommands { get { return mActiveCommands.Values; } }
         public IEnumerable<ICommand> QueuedCommands { get { return mCommandQueue; } }
 
+        /// Will be triggered if the active command is aborted
+        public Action onActiveCommandAbort;
+        /// Will be triggered if a new command popped to an active command
+        public Action onNewCommandPop;
+        /// Get the active Flightmode
+        public AttitudeCommand currentFlightMode { get { return (mActiveCommands[0] is AttitudeCommand) ? (AttitudeCommand)mActiveCommands[0] : null; } }
+
         // Flight controller parameters from MechJeb, copied from master on June 27, 2014
         public PIDControllerV2 pid { get; private set; }
         public Vector3d lastAct { get; set; }
@@ -79,9 +86,11 @@ namespace RemoteTech.FlightComputer
         private readonly SortedDictionary<int, ICommand> mActiveCommands = new SortedDictionary<int, ICommand>();
         private readonly List<ICommand> mCommandQueue = new List<ICommand>();
         private readonly PriorityQueue<DelayedFlightCtrlState> mFlightCtrlQueue = new PriorityQueue<DelayedFlightCtrlState>();
-        
+
         private FlightComputerWindow mWindow;
         public FlightComputerWindow Window { get { if (mWindow != null) mWindow.Hide(); return mWindow = new FlightComputerWindow(this); } }
+
+        public RoverComputer mRoverComputer { get; private set; }
 
         public FlightComputer(ISignalProcessor s)
         {
@@ -96,8 +105,11 @@ namespace RemoteTech.FlightComputer
             mActiveCommands[attitude.Priority] = attitude;
 
             GameEvents.onVesselChange.Add(OnVesselChange);
+
+            mRoverComputer = new RoverComputer();
+            mRoverComputer.SetVessel(Vessel);
         }
-        
+
         /// <summary>
         /// After switching the vessel close the current flightcomputer.
         /// </summary>
@@ -129,6 +141,8 @@ namespace RemoteTech.FlightComputer
             {
                 cmd.Abort();
             }
+
+            onActiveCommandAbort.Invoke();
         }
 
         public void Enqueue(ICommand cmd, bool ignore_control = false, bool ignore_delay = false, bool ignore_extra = false)
@@ -161,7 +175,10 @@ namespace RemoteTech.FlightComputer
         public void OnFixedUpdate()
         {
             if (Vessel == null)
+            {
                 Vessel = SignalProcessor.Vessel;
+                mRoverComputer.SetVessel(Vessel);
+            }
 
             // only handle onFixedUpdate if the ship is unpacked
             if (Vessel.packed)
@@ -182,6 +199,7 @@ namespace RemoteTech.FlightComputer
             {
                 SanctionedPilots.Clear();
                 Vessel = SignalProcessor.Vessel;
+                mRoverComputer.SetVessel(Vessel);
             }
             Vessel.OnFlyByWire = OnFlyByWirePre + Vessel.OnFlyByWire + OnFlyByWirePost;
 
@@ -233,19 +251,25 @@ namespace RemoteTech.FlightComputer
                     }
                 }
 
-                foreach (var dc in mCommandQueue.TakeWhile(c => c.TimeStamp <= RTUtil.GameTime).ToList())
+                // Proceed the extraDelay for every command where the normal delay is over
+                foreach (var dc in mCommandQueue.Where(s=>s.Delay==0).ToList())
                 {
                     // Use time decrement instead of comparing scheduled time, in case we later want to 
                     //      reinstate event clocks stopping under certain conditions
                     if (dc.ExtraDelay > 0)
                     {
                         dc.ExtraDelay -= TimeWarp.deltaTime;
-                    }
-                    else
+                    } else
                     {
-                        if (SignalProcessor.Powered) {
+                        if (SignalProcessor.Powered)
+                        {
                             // Note: depending on implementation, dc.Pop() may execute the event
-                            if (dc.Pop(this)) mActiveCommands [dc.Priority] = dc;
+                            if (dc.Pop(this)) {
+                                mActiveCommands[dc.Priority] = dc;
+                                if (onNewCommandPop != null) {
+                                    onNewCommandPop.Invoke();
+                                }
+                            }
                         } else {
                             string message = String.Format ("[Flight Computer]: Out of power, cannot run \"{0}\" on schedule.", dc.ShortName);
                             ScreenMessages.PostScreenMessage(new ScreenMessage(
@@ -309,20 +333,21 @@ namespace RemoteTech.FlightComputer
         // Probably because the ship is only half-initialized...
         public void updatePIDParameters()
         {
-            if (Vessel != null) {
-                Vector3d torque = SteeringHelper.GetTorque (Vessel, 
+            if (Vessel != null)
+            {
+                Vector3d torque = SteeringHelper.GetTorque(Vessel,
                     Vessel.ctrlState != null ? Vessel.ctrlState.mainThrottle : 0.0f);
-                var CoM = Vessel.findWorldCenterOfMass ();
-                var MoI = Vessel.findLocalMOI (CoM);
+                var CoM = Vessel.findWorldCenterOfMass();
+                var MoI = Vessel.findLocalMOI(CoM);
 
-                Vector3d ratio = new Vector3d (
+                Vector3d ratio = new Vector3d(
                                  torque.x != 0 ? MoI.x / torque.x : 0,
                                  torque.y != 0 ? MoI.y / torque.y : 0,
                                  torque.z != 0 ? MoI.z / torque.z : 0
                              );
 
-                Tf = Mathf.Clamp ((float)ratio.magnitude / 20f, 2 * TimeWarp.fixedDeltaTime, 1f);
-                Tf = Mathf.Clamp ((float)Tf, (float)TfMin, (float)TfMax);
+                Tf = Mathf.Clamp((float)ratio.magnitude / 20f, 2 * TimeWarp.fixedDeltaTime, 1f);
+                Tf = Mathf.Clamp((float)Tf, (float)TfMin, (float)TfMax);
             }
             initPIDParameters();
         }
@@ -341,7 +366,7 @@ namespace RemoteTech.FlightComputer
             mCommandQueue.Clear();
 
             // add the sorted queue
-            foreach(var command in backupList)
+            foreach (var command in backupList)
             {
                 mCommandQueue.Add(command);
             }
@@ -353,7 +378,7 @@ namespace RemoteTech.FlightComputer
         /// <param name="n">Node with the informations for the flightcomputer</param>
         public void load(ConfigNode n)
         {
-            RTLog.Notify("Loading Flightcomputer from persistant!");
+            RTLog.Notify("Loading Flightcomputer from persistent!");
 
             if (!n.HasNode("FlightComputer"))
                 return;
@@ -368,7 +393,10 @@ namespace RemoteTech.FlightComputer
 
             // Load the current vessel from signalprocessor if we've no on the flightcomputer
             if (Vessel == null)
+            {
                 Vessel = SignalProcessor.Vessel;
+                mRoverComputer.SetVessel(Vessel);
+            }
 
             // Read Flightcomputer informations
             ConfigNode FlightNode = n.GetNode("FlightComputer");
@@ -384,7 +412,7 @@ namespace RemoteTech.FlightComputer
                 foreach (ConfigNode cmdNode in ActiveCommands.nodes)
                 {
                     ICommand cmd = AbstractCommand.LoadCommand(cmdNode, this);
-                    
+
                     if (cmd != null)
                     {
                         mActiveCommands[cmd.Priority] = cmd;
@@ -402,7 +430,7 @@ namespace RemoteTech.FlightComputer
                 if (mCommandQueue.Count > 0)
                     mCommandQueue.Clear();
 
-                RTLog.Notify("Loading queued commands from persistant ...");
+                RTLog.Notify("Loading queued commands from persistent ...");
                 foreach (ConfigNode cmdNode in Commands.nodes)
                 {
                     ICommand cmd = AbstractCommand.LoadCommand(cmdNode, this);
@@ -424,7 +452,6 @@ namespace RemoteTech.FlightComputer
                             if (cmd.ExtraDelay > 0)
                             {
                                 cmd.ExtraDelay = cmd.TimeStamp  + cmd.ExtraDelay - RTUtil.GameTime;
-                                cmd.TimeStamp = RTUtil.GameTime;
 
                                 // Are we ready to handle the command ?
                                 if (cmd.ExtraDelay <= 0)
@@ -434,8 +461,7 @@ namespace RemoteTech.FlightComputer
                                         // TODO: Need better text
                                         RTUtil.ScreenMessage("You missed the burn command!");
                                         continue;
-                                    }
-                                    else
+                                    } else
                                     {
                                         // change the extra delay to x/100
                                         cmd.ExtraDelay = (qCounter) / 100;
@@ -460,7 +486,7 @@ namespace RemoteTech.FlightComputer
 
             ConfigNode ActiveCommands = new ConfigNode("ActiveCommands");
             ConfigNode Commands = new ConfigNode("Commands");
-            
+
             foreach (KeyValuePair<int, ICommand> cmd in mActiveCommands)
             {
                 cmd.Value.Save(ActiveCommands, this);
